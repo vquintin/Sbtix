@@ -23,7 +23,7 @@ let
 
   pluginsSbtix = writeText "plugins.sbt" ''
     resolvers += Resolver.file("Sbtix Plugin Repo", file("${sbtixPluginRepo}/plugin-repo"))(Resolver.ivyStylePatterns)
-
+    classpathTypes += "maven-plugin"
     addSbtPlugin("se.nullable.sbtix" % "sbtix" % "${version}${versionSnapshotSuffix}")
   '';
 
