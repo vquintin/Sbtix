@@ -1,22 +1,30 @@
 package se.nullable.sbtix
 
 import java.io.File
-import java.net.{ URI, URL }
+import java.net.{URI, URL}
 
 import sbt.ProjectRef
 import coursier._
 import coursier.core.Authentication
-import sbt.{ Logger, ModuleID, Resolver, PatternsBasedRepository }
+import sbt.{Logger, ModuleID, PatternsBasedRepository, Resolver}
 
 import scalaz.concurrent.Task
-
-import scalaz.{ -\/, \/-, EitherT }
+import scalaz.{-\/, EitherT, \/-}
 import java.util.concurrent.ConcurrentSkipListSet
+
 import scala.collection.JavaConverters._
 import java.util.concurrent.ExecutorService
+
 import scala.concurrent.duration.Duration
 import scala.util.control.NonFatal
-import java.nio.file.{ StandardCopyOption, Files => NioFiles }
+import java.nio.file.{StandardCopyOption, Files => NioFiles}
+
+import matryoshka.Coalgebra
+import matryoshka._
+import matryoshka.data._
+import matryoshka.implicits._
+import se.nullable.sbtix.data.RoseTreeF
+
 case class GenericModule(primaryArtifact: Artifact, dep: Dependency, localFile: java.io.File) {
   private val isIvy = localFile.getParentFile().getName() == "jars"
   private val moduleId = ToSbt.moduleId(dep, Map())
@@ -56,24 +64,28 @@ case class GenericModule(primaryArtifact: Artifact, dep: Dependency, localFile: 
   /**
     * local location of the module and all related artifacts
     */
-  val localSearchLocation = if (isIvy) { localFile.getParentFile().getParentFile() } else { localFile.getParentFile() }
+  val localSearchLocation = if (isIvy) {
+    localFile.getParentFile().getParentFile()
+  } else {
+    localFile.getParentFile()
+  }
 }
 
-case class MetaArtifact(artifactUrl: String, checkSum:String) extends Comparable[MetaArtifact] {
+case class MetaArtifact(artifactUrl: String, checkSum: String) extends Comparable[MetaArtifact] {
   override def compareTo(other: MetaArtifact): Int = {
     return artifactUrl.compareTo(other.artifactUrl)
   }
-  
-  def matchesGenericModule(gm:GenericModule) = {
+
+  def matchesGenericModule(gm: GenericModule) = {
     val organ = gm.dep.module.organization
     val name = gm.dep.module.name
     val version = gm.dep.version
-    
+
     val slashOrgans = organ.replace(".", "/")
-    
+
     val mvn = s"$slashOrgans/$name/$version"
     val ivy = s"$organ/$name/$version"
-    
+
     artifactUrl.contains(mvn) || artifactUrl.contains(ivy)
   }
 }
@@ -84,13 +96,17 @@ class CoursierArtifactFetcher(logger: Logger, resolvers: Set[Resolver], credenti
   val metaArtifactCollector = new ConcurrentSkipListSet[MetaArtifact]()
 
   def apply(depends: Set[Dependency]): (Set[NixRepo], Set[NixArtifact], Set[ResolutionErrors]) = {
-    val (mods1,errors) = depends.map(x => buildNixProject(x)).unzip
+    val (mods1, errors) = depends.map(x => buildNixProject(x)).unzip
 
     val mods = mods1.flatten
-    
+
     //remove metaArtifacts that we already have a module for. We do not need to look them up twice.
-    val metaArtifacts = metaArtifactCollector.asScala.toSet.filterNot { meta =>mods.exists { meta.matchesGenericModule} }
-    
+    val metaArtifacts = metaArtifactCollector.asScala.toSet.filterNot { meta =>
+      mods.exists {
+        meta.matchesGenericModule
+      }
+    }
+
     //object to work with the rootUrl of Resolvers
     val nixResolver = resolvers.map(NixResolver.resolve)
 
@@ -99,7 +115,7 @@ class CoursierArtifactFetcher(logger: Logger, resolvers: Set[Resolver], credenti
 
     //retrieve metaArtifacts that were missed. Mostly parent POMS
     val (metaRepoSeq, metaArtifactsSeqSeq) = nixResolver.flatMap(_.filterMetaArtifacts(logger, metaArtifacts)).unzip
-    
+
     val nixArtifacts = (artifactsSeqSeq.flatten ++ metaArtifactsSeqSeq.flatten)
 
     val nixRepos = (repoSeq ++ metaRepoSeq)
@@ -111,49 +127,49 @@ class CoursierArtifactFetcher(logger: Logger, resolvers: Set[Resolver], credenti
     * modification of coursier.Cache.Fetch()
     */
   def CacheFetch_WithCollector(
-    cache: File = Cache.default,
-    cachePolicy: CachePolicy = CachePolicy.FetchMissing,
-    checksums: Seq[Option[String]] = Cache.defaultChecksums,
-    logger: Option[Cache.Logger] = None,
-    pool: ExecutorService = Cache.defaultPool,
-    ttl: Option[Duration] = Cache.defaultTtl
-  ): Fetch.Content[Task] = {
+                                cache: File = Cache.default,
+                                cachePolicy: CachePolicy = CachePolicy.FetchMissing,
+                                checksums: Seq[Option[String]] = Cache.defaultChecksums,
+                                logger: Option[Cache.Logger] = None,
+                                pool: ExecutorService = Cache.defaultPool,
+                                ttl: Option[Duration] = Cache.defaultTtl
+                              ): Fetch.Content[Task] = {
     artifact =>
-    Cache.file(
-      artifact,
-      cache,
-      cachePolicy,
-      checksums = checksums,
-      logger = logger,
-      pool = pool,
-      ttl = ttl
-    ).leftMap(_.describe).flatMap { f =>
+      Cache.file(
+        artifact,
+        cache,
+        cachePolicy,
+        checksums = checksums,
+        logger = logger,
+        pool = pool,
+        ttl = ttl
+      ).leftMap(_.describe).flatMap { f =>
 
-      def notFound(f: File) = Left(s"${f.getCanonicalPath} not found")
-      
-      def read(f: File) =
-        try Right(new String(NioFiles.readAllBytes(f.toPath), "UTF-8").stripPrefix("\ufeff"))
-        catch {
-          case NonFatal(e) =>
-            Left(s"Could not read (file:${f.getCanonicalPath}): ${e.getMessage}")
-        }
+        def notFound(f: File) = Left(s"${f.getCanonicalPath} not found")
 
-      val res = if (f.exists()) {
-        if (f.isDirectory) {
-          if (artifact.url.startsWith("file:")) {
+        def read(f: File) =
+          try Right(new String(NioFiles.readAllBytes(f.toPath), "UTF-8").stripPrefix("\ufeff"))
+          catch {
+            case NonFatal(e) =>
+              Left(s"Could not read (file:${f.getCanonicalPath}): ${e.getMessage}")
+          }
 
-            val elements = f.listFiles().map { c =>
-              val name = c.getName
-              val name0 = if (c.isDirectory)
-                            name + "/"
-                          else
-                            name
+        val res = if (f.exists()) {
+          if (f.isDirectory) {
+            if (artifact.url.startsWith("file:")) {
 
-              s"""<li><a href="$name0">$name0</a></li>"""
-            }.mkString
+              val elements = f.listFiles().map { c =>
+                val name = c.getName
+                val name0 = if (c.isDirectory)
+                  name + "/"
+                else
+                  name
 
-            val page =
-              s"""<!DOCTYPE html>
+                s"""<li><a href="$name0">$name0</a></li>"""
+              }.mkString
+
+              val page =
+                s"""<!DOCTYPE html>
                    |<html>
                    |<head></head>
                    |<body>
@@ -164,37 +180,38 @@ class CoursierArtifactFetcher(logger: Logger, resolvers: Set[Resolver], credenti
                    |</html>
                  """.stripMargin
 
-            Right(page)
-          } else {
-            val f0 = new File(f, ".directory")
+              Right(page)
+            } else {
+              val f0 = new File(f, ".directory")
 
-            if (f0.exists()) {
-              if (f0.isDirectory)
-                Left(s"Woops: ${f.getCanonicalPath} is a directory")
-              else
-                read(f0)
-            } else
+              if (f0.exists()) {
+                if (f0.isDirectory)
+                  Left(s"Woops: ${f.getCanonicalPath} is a directory")
+                else
+                  read(f0)
+              } else
                 notFound(f0)
-          }
-        } else
+            }
+          } else
             read(f)
-      } else
+        } else
           notFound(f)
-      
-      if (res.isRight) {
-        //only collect the http and https urls
-        if (artifact.url.startsWith("http")) {
-          //reduce the number of tried and failed metaArtifacts by checking if Coursier succeeded in its download
-          val checkSum = FindArtifactsOfRepo.fetchChecksum(artifact.url, "-Meta- Artifact",f.toURI().toURL()).get // TODO this might be expressed in a monad
-          metaArtifactCollector.add(MetaArtifact(artifact.url,checkSum))
+
+        if (res.isRight) {
+          //only collect the http and https urls
+          if (artifact.url.startsWith("http")) {
+            //reduce the number of tried and failed metaArtifacts by checking if Coursier succeeded in its download
+            val checkSum = FindArtifactsOfRepo.fetchChecksum(artifact.url, "-Meta- Artifact", f.toURI().toURL()).get // TODO this might be expressed in a monad
+            metaArtifactCollector.add(MetaArtifact(artifact.url, checkSum))
+          }
         }
+        EitherT.fromEither(Task.now[Either[String, String]](res))
       }
-      EitherT.fromEither(Task.now[Either[String, String]](res))
-    }
   }
-  
+
   //coursier must take dependencies one at a time, otherwise it only resolves the most recent version of a module, which causes missed dependencies.
-  private def buildNixProject(module: Dependency): (Seq[GenericModule],ResolutionErrors) = {
+  private def buildNixProject(module: Dependency): (Seq[GenericModule], ResolutionErrors) = {
+    getAllDependencies(module)
     val res = Resolution(Set(module))
 
     val repos = resolvers.flatMap { resolver =>
@@ -208,23 +225,64 @@ class CoursierArtifactFetcher(logger: Logger, resolvers: Set[Resolver], credenti
     val modules = resolution.dependencyArtifacts.flatMap {
       case ((dependency, artifact)) =>
         val downloadedArtifact = Cache.file(artifact).run.unsafePerformSync
-        
+
         downloadedArtifact.toOption.map { localFile => GenericModule(artifact, dependency, localFile) }
     }
-    (modules,ResolutionErrors(resolution.errors))
+    (modules, ResolutionErrors(resolution.errors))
+  }
+
+  private def getAllDependencies(module: Dependency): List[(Dependency, Artifact)] = {
+    val res = Resolution(Set(module))
+
+    val repos = resolvers.flatMap { resolver =>
+      FromSbt.repository(resolver, ivyProps, logger, credentials.get(resolver.name).map(_.authentication))
+    }
+    val fetch = Fetch.from(repos.toSeq, CacheFetch_WithCollector())
+    val resolution = res.process.run(fetch, 100).unsafePerformSync
+
+    type F[X] = RoseTreeF[Dependency, X]
+
+    def getDeps(withReconciledVersions: Boolean): Coalgebra[F, Dependency] = { dep =>
+      RoseTreeF(dep, resolution.dependenciesOf(dep, withReconciledVersions).toList)
+    }
+
+    val reconcilied = module.ana[Fix[F]](getDeps(true))
+    val raw = module.ana[Fix[F]](getDeps(false))
+    println(s"raw:        $raw")
+    println(s"reconciled: $reconcilied")
+
+    val coalgebra: Coalgebra[F, Either[Fix[F], (Fix[F], Fix[F])]] = {
+      case Right((raw, reconciled)) =>
+        val rawMap = raw.unFix.children.map { t => t.unFix.value -> t.unFix.children }.toMap
+        val recMap = reconcilied.unFix.children.map { t => t.unFix.value -> t.unFix.children }.toMap
+        val diff: List[Either[Fix[F], (Fix[F], Fix[F])]] =
+          rawMap.keySet.diff(recMap.keySet).map { dep =>
+            val x: Either[Fix[F], (Fix[F], Fix[F])] = Left(Fix[F](RoseTreeF(dep, rawMap(dep))))
+            x
+          }.toList
+        val intersection: List[Either[Fix[F], (Fix[F], Fix[F])]] =
+          rawMap.keySet.intersect(recMap.keySet).map { dep =>
+            val x: Either[Fix[F], (Fix[F], Fix[F])] = Right((Fix[F](RoseTreeF(dep, rawMap(dep))), Fix[F](RoseTreeF(dep, recMap(dep)))))
+            x
+          }.toList
+        RoseTreeF[Dependency, Either[Fix[F], (Fix[F], Fix[F])]](raw.unFix.value, diff ++ intersection)
+      case Left(raw) => ???
+    }
+    (raw, reconcilied).hylo[F, Fix[F]](???, ???)
+    List.empty
   }
 
   private def ivyProps = Map("ivy.home" -> new File(sys.props("user.home"), ".ivy2").toString) ++ sys.props
 }
 
-case class ResolutionErrors(errors: Seq[(Dependency,Seq[String])]) {
-  
-  def +(other:ResolutionErrors) = {
+case class ResolutionErrors(errors: Seq[(Dependency, Seq[String])]) {
+
+  def +(other: ResolutionErrors) = {
     ResolutionErrors(errors ++ other.errors)
   }
-  
-  def +(other:Seq[ResolutionErrors]) = {
+
+  def +(other: Seq[ResolutionErrors]) = {
     ResolutionErrors(errors ++ other.flatMap(_.errors))
   }
-  
+
 }
