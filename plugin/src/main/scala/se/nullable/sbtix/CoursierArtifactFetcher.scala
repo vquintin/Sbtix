@@ -211,47 +211,49 @@ class CoursierArtifactFetcher(logger: Logger, resolvers: Set[Resolver], credenti
 
   //coursier must take dependencies one at a time, otherwise it only resolves the most recent version of a module, which causes missed dependencies.
   private def buildNixProject(module: Dependency): (Seq[GenericModule], ResolutionErrors) = {
-    getAllDependencies(module)
-    val res = Resolution(Set(module))
-
-    val repos = resolvers.flatMap { resolver =>
-      FromSbt.repository(resolver, ivyProps, logger, credentials.get(resolver.name).map(_.authentication))
-    }
-    val fetch = Fetch.from(repos.toSeq, CacheFetch_WithCollector())
-    val resolution = res.process.run(fetch, 100).unsafePerformSync
-
-    assert(resolution.isDone)
-
-    val modules = resolution.dependencyArtifacts.flatMap {
+    val modules = getAllDependencies(module).flatMap {
       case ((dependency, artifact)) =>
         val downloadedArtifact = Cache.file(artifact).run.unsafePerformSync
 
         downloadedArtifact.toOption.map { localFile => GenericModule(artifact, dependency, localFile) }
     }
-    (modules, ResolutionErrors(resolution.errors))
+    (modules.toSeq, ResolutionErrors(Seq.empty))
   }
 
-  private def getAllDependencies(module: Dependency): List[(Dependency, Artifact)] = {
-    val res = Resolution(Set(module))
+  private def getAllDependencies(module: Dependency): Set[(Dependency, Artifact)] = {
 
     val repos = resolvers.flatMap { resolver =>
       FromSbt.repository(resolver, ivyProps, logger, credentials.get(resolver.name).map(_.authentication))
     }
     val fetch = Fetch.from(repos.toSeq, CacheFetch_WithCollector())
-    val resolution = res.process.run(fetch, 100).unsafePerformSync
 
-    type F[X] = RoseTreeF[Dependency, X]
-
-    def getDeps(withReconciledVersions: Boolean): Coalgebra[F, Dependency] = { dep =>
-      RoseTreeF(dep, resolution.dependenciesOf(dep, withReconciledVersions).toList)
+    def go(module: Dependency): Set[(Dependency, Artifact)] = {
+      val res = Resolution(Set(module))
+      val resolution = res.process.run(fetch, 100).unsafePerformSync
+      val missingDependencies = findMissingDependencies(module, resolution)
+      resolution.dependencyArtifacts(true).toSet
+        .union(resolution.dependencyClassifiersArtifacts(Seq("tests", "sources", "javadoc")).toSet)
+        .union(missingDependencies.flatMap(go))
     }
 
-    val reconcilied = module.ana[Fix[F]](getDeps(true))
-    val raw = module.ana[Fix[F]](getDeps(false))
-    println(s"raw:        $raw")
-    println(s"reconciled: $reconcilied")
+    go(module)
+  }
 
-    val coalgebra: Coalgebra[F, Either[Fix[F], (Fix[F], Fix[F])]] = {
+  private def findMissingDependencies(module: Dependency, resolution: Resolution): Set[Dependency] = {
+    type F[X] = RoseTreeF[Dependency, X]
+
+    def getDeps(withReconciledVersions: Boolean): Coalgebra[F, (Int, Dependency)] = {
+      case (0, dep) =>
+        RoseTreeF(dep, List.empty)
+      case (n, dep) =>
+        RoseTreeF(dep, resolution.dependenciesOf(dep, withReconciledVersions).toList.map(d => (n - 1, d)))
+    }
+
+    val reconcilied = (100, module).ana[Fix[F]](getDeps(true))
+    val raw = (100, module).ana[Fix[F]](getDeps(false))
+
+    type G[X] = RoseTreeF[Either[Dependency, Dependency], X]
+    val coalgebra: Coalgebra[G, Either[Fix[F], (Fix[F], Fix[F])]] = {
       case Right((raw, reconciled)) =>
         val rawMap = raw.unFix.children.map { t => t.unFix.value -> t.unFix.children }.toMap
         val recMap = reconcilied.unFix.children.map { t => t.unFix.value -> t.unFix.children }.toMap
@@ -265,11 +267,32 @@ class CoursierArtifactFetcher(logger: Logger, resolvers: Set[Resolver], credenti
             val x: Either[Fix[F], (Fix[F], Fix[F])] = Right((Fix[F](RoseTreeF(dep, rawMap(dep))), Fix[F](RoseTreeF(dep, recMap(dep)))))
             x
           }.toList
-        RoseTreeF[Dependency, Either[Fix[F], (Fix[F], Fix[F])]](raw.unFix.value, diff ++ intersection)
-      case Left(raw) => ???
+        RoseTreeF(Right(raw.unFix.value), diff ++ intersection)
+      case Left(raw) =>
+        RoseTreeF(Left(raw.unFix.value), raw.unFix.children.map((g: Fix[F]) => Left(g)))
     }
-    (raw, reconcilied).hylo[F, Fix[F]](???, ???)
-    List.empty
+
+    val algebra: Algebra[G, Fix[G]] = {
+      case RoseTreeF(d@Left(dep), children) =>
+        Fix[G](RoseTreeF(d, children))
+      case RoseTreeF(Right(dep), children) =>
+        val newChildren = children.filter(_.unFix.value.isLeft)
+        if (newChildren.isEmpty) {
+          Fix[G](RoseTreeF(Right(dep), newChildren))
+        } else {
+          Fix[G](RoseTreeF(Left(dep), newChildren))
+        }
+    }
+
+    val x: Either[Fix[F], (Fix[F], Fix[F])] = Right((raw, reconcilied))
+    val tree0 = x.hylo[G, Fix[G]](algebra, coalgebra)
+    val possiblyMissingDependencies = tree0.cata[Set[Dependency]] {
+      case RoseTreeF(Right(_), children) => children.toSet.flatten
+      case RoseTreeF(Left(dep), children) => children.toSet.flatten + dep
+    }
+    val missingDependencies = possiblyMissingDependencies.diff(resolution.dependencies)
+    println(s"missingDependencies: $missingDependencies")
+    missingDependencies
   }
 
   private def ivyProps = Map("ivy.home" -> new File(sys.props("user.home"), ".ivy2").toString) ++ sys.props
