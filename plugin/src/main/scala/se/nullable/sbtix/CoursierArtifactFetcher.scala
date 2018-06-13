@@ -96,9 +96,7 @@ class CoursierArtifactFetcher(logger: Logger, resolvers: Set[Resolver], credenti
   val metaArtifactCollector = new ConcurrentSkipListSet[MetaArtifact]()
 
   def apply(depends: Set[Dependency]): (Set[NixRepo], Set[NixArtifact], Set[ResolutionErrors]) = {
-    val (mods1, errors) = depends.map(x => buildNixProject(x)).unzip
-
-    val mods = mods1.flatten
+    val (mods, errors) = buildNixProject(depends)
 
     //remove metaArtifacts that we already have a module for. We do not need to look them up twice.
     val metaArtifacts = metaArtifactCollector.asScala.toSet.filterNot { meta =>
@@ -120,7 +118,7 @@ class CoursierArtifactFetcher(logger: Logger, resolvers: Set[Resolver], credenti
 
     val nixRepos = (repoSeq ++ metaRepoSeq)
 
-    (nixRepos, nixArtifacts, errors)
+    (nixRepos, nixArtifacts, Set(errors))
   }
 
   /**
@@ -210,33 +208,43 @@ class CoursierArtifactFetcher(logger: Logger, resolvers: Set[Resolver], credenti
   }
 
   //coursier must take dependencies one at a time, otherwise it only resolves the most recent version of a module, which causes missed dependencies.
-  private def buildNixProject(module: Dependency): (Seq[GenericModule], ResolutionErrors) = {
-    val modules = getAllDependencies(module).flatMap {
+  private def buildNixProject(modules: Set[Dependency]): (Set[GenericModule], ResolutionErrors) = {
+    val dependenciesArtifacts = getAllDependencies(modules).flatMap {
       case ((dependency, artifact)) =>
         val downloadedArtifact = Cache.file(artifact).run.unsafePerformSync
 
         downloadedArtifact.toOption.map { localFile => GenericModule(artifact, dependency, localFile) }
     }
-    (modules.toSeq, ResolutionErrors(Seq.empty))
+    (dependenciesArtifacts, ResolutionErrors(Seq.empty))
   }
 
-  private def getAllDependencies(module: Dependency): Set[(Dependency, Artifact)] = {
+  private def getAllDependencies(modules: Set[Dependency]): Set[(Dependency, Artifact)] = {
 
     val repos = resolvers.flatMap { resolver =>
       FromSbt.repository(resolver, ivyProps, logger, credentials.get(resolver.name).map(_.authentication))
     }
     val fetch = Fetch.from(repos.toSeq, CacheFetch_WithCollector())
 
-    def go(module: Dependency): Set[(Dependency, Artifact)] = {
-      val res = Resolution(Set(module))
+    def go(modules: Set[Dependency]): Set[(Dependency, Artifact)] = {
+      val res = Resolution(modules)
       val resolution = res.process.run(fetch, 100).unsafePerformSync
-      val missingDependencies = findMissingDependencies(module, resolution)
+      val missingDependencies = findMissingDependencies(modules, resolution)
       resolution.dependencyArtifacts(true).toSet
         .union(resolution.dependencyClassifiersArtifacts(Seq("tests", "sources", "javadoc")).toSet)
-        .union(missingDependencies.flatMap(go))
+        .union(missingDependencies.flatMap(dep => go(Set(dep))))
     }
 
-    go(module)
+    go(modules)
+  }
+
+  private def findMissingDependencies(dependencies: Set[Dependency], resolution: Resolution): Set[Dependency] = {
+    dependencies.flatMap { dep =>
+      if (resolution.dependencies.contains(dep)) {
+        findMissingDependencies(dep, resolution)
+      } else {
+        Set(dep)
+      }
+    }
   }
 
   private def findMissingDependencies(module: Dependency, resolution: Resolution): Set[Dependency] = {
