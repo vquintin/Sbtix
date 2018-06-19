@@ -69,10 +69,10 @@ class FindArtifactsOfRepo(repoName: String, root: String) {
         val calcUrlWithoutAuth = ga.calculateURIWithoutAuth(artifactLocalFile).toURL.toString
         println(s"url without auth: $calcUrlWithoutAuth")
         NixArtifact(
-          repoName,
-          calcUrl.replace(authedRootURI.toString, "").stripPrefix("/"),
-          calcUrlWithoutAuth,
-          FindArtifactsOfRepo
+          repoName = repoName,
+          relative = calcUrl.replace(authedRootURI.toString, "").stripPrefix("/"),
+          url = calcUrlWithoutAuth,
+          sha256 = FindArtifactsOfRepo
             .fetchChecksum(calcUrl,
                            "Artifact",
                            artifactLocalFile.toURI.toURL)
@@ -84,11 +84,12 @@ class FindArtifactsOfRepo(repoName: String, root: String) {
   def findMetaArtifacts(logger: Logger,
                         metaArtifacts: Set[MetaArtifact]): Set[NixArtifact] = {
     metaArtifacts.map { meta =>
+      println(s"meta artifact url: ${meta.artifactUrl}")
       NixArtifact(
-        repoName,
-        meta.artifactUrl.replace(root, "").stripPrefix("/"),
-        meta.artifactUrl,
-        meta.checkSum
+        repoName = repoName,
+        relative = meta.artifactUrl.replace(root, "").stripPrefix("/"),
+        url = meta.artifactUrl,
+        sha256 = meta.checkSum
       )
     }
   }

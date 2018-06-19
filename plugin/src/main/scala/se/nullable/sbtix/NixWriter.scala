@@ -88,9 +88,11 @@ case class NixArtifact(repoName: String,
     extends NixBuilder {
   val toNixRef = s"${quote(repoName + "/" + relative)}"
 
-  def toNixValue =
+  def toNixValue = {
+    println(s"url: $url")
     s"""{
-        |  url = ${quote(url)};
-        |  sha256 = ${quote(sha256)};
-        |}""".stripMargin
+       |  url = ${quote(url)};
+       |  sha256 = ${quote(sha256)};
+       |}""".stripMargin
+  }
 }
